@@ -1,0 +1,122 @@
+name: Validate Community PR
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+concurrency:
+  group: validate-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write  # G5: necesario para comentar en PRs de forks
+      actions: write        # necesario para upload-artifact en repos restrictivos
+
+    steps:
+      - name: Skip if bot commit
+        id: skip_check
+        run: |
+          COMMIT_JSON=$(curl -s \
+            "https://api.github.com/repos/${{ github.repository }}/commits/${{ github.event.pull_request.head.sha }}" \
+            | jq -r '{author: (.author.login // "unknown"), committer: (.committer.login // "unknown")}')
+          AUTHOR=$(echo "$COMMIT_JSON" | jq -r '.author')
+          COMMITTER=$(echo "$COMMIT_JSON" | jq -r '.committer')
+          if echo "$AUTHOR $COMMITTER" | grep -qE "github-actions\[bot\]|Gimbarr-Nomenclatura-Sync\[bot\]|\[Bot\]belito"; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout PR branch
+        if: steps.skip_check.outputs.skip != 'true'
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Validate scope — reject .github/ changes
+        if: steps.skip_check.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+          INVALID=$(git rev-list "$BASE..$HEAD" | while read C; do \
+            git diff-tree --no-commit-id --name-only -r "$C"; \
+          done | grep -E '^\.github/' || true)
+          if [ -n "$INVALID" ]; then
+            echo "❌ PR touches .github/ — not allowed"
+            echo "$INVALID"
+            gh pr close ${{ github.event.pull_request.number }} \
+              --repo ${{ github.repository }} \
+              --comment "❌ Este PR contiene cambios en \`.github/\`, que no está permitido. Solo se aceptan cambios en los archivos de documentación del repositorio."
+            exit 1
+          fi
+          echo "✅ All commits only touch allowed paths"
+
+      - name: Generate patches
+        if: steps.skip_check.outputs.skip != 'true'
+        id: generate_patches
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+          mkdir -p /tmp/artifact/patch-sequence
+
+          git format-patch "${BASE}..${HEAD}" -o /tmp/artifact/patch-sequence/
+
+          PATCH_COUNT=$(ls /tmp/artifact/patch-sequence/*.patch 2>/dev/null | wc -l || echo 0)
+          if [ "$PATCH_COUNT" -eq 0 ]; then
+            echo "No patches generated"
+            echo "patches_found=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "patches_found=true" >> "$GITHUB_OUTPUT"
+            echo "Patches generated: $PATCH_COUNT"
+            ls -la /tmp/artifact/patch-sequence/
+          fi
+
+      - name: Generate metadata files
+        if: steps.skip_check.outputs.skip != 'true' && steps.generate_patches.outputs.patches_found == 'true'
+        run: |
+          mkdir -p /tmp/artifact
+          PR_NUM="${{ github.event.pull_request.number }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          HEAD_REF="${{ github.event.pull_request.head.ref }}"
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+
+          cat > /tmp/artifact/manifest.json <<EOF
+          {
+            "public_repo": "${{ github.repository }}",
+            "public_pr": ${PR_NUM},
+            "public_sha": "${HEAD_SHA}",
+            "public_head_ref": "${HEAD_REF}",
+            "base_sha": "${BASE_SHA}",
+            "created_at": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          }
+          EOF
+
+          # G4: nombre correcto con punto inicial (.sync-metadata.yml)
+          cat > /tmp/artifact/.sync-metadata.yml <<EOF
+          sync:
+            type: gimbarr-community-mirror
+          public:
+            repository: ${{ github.repository }}
+            pull_request: ${PR_NUM}
+            head_sha: ${HEAD_SHA}
+            head_ref: ${HEAD_REF}
+          mirror:
+            created_by: validate-community-pr.yml
+          EOF
+
+          echo "manifest.json + .sync-metadata.yml generated"
+
+      - name: Upload artifact
+        if: steps.skip_check.outputs.skip != 'true' && steps.generate_patches.outputs.patches_found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: community-pr-patch
+          path: /tmp/artifact/
+          retention-days: 7
+          include-hidden-files: true

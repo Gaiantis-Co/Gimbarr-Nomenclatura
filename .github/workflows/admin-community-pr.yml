@@ -1,0 +1,27 @@
+name: Admin Community PR
+
+on:
+  pull_request_target:
+    types: [opened, synchronize]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  close-invalid:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Close PR if it touches .github/
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR_NUM=${{ github.event.pull_request.number }}
+          FILES=$(gh pr diff "$PR_NUM" --repo ${{ github.repository }} --name-only 2>/dev/null || true)
+          BANNED=$(echo "$FILES" | grep -E '^\.github/' || true)
+          if [ -n "$BANNED" ]; then
+            echo "❌ PR #${PR_NUM} touches .github/ — closing"
+            echo "$BANNED"
+            gh pr close "$PR_NUM" \
+              --repo ${{ github.repository }} \
+              --comment "❌ Este PR contiene cambios en \`.github/\`, que no está permitido. Solo se aceptan cambios en los archivos de documentación del repositorio."
+          fi

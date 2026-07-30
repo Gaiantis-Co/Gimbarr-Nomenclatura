@@ -1,0 +1,427 @@
+name: Sync PR to Private Repo
+
+on:
+  workflow_run:
+    workflows: ["Validate Community PR"]
+    types: [completed]
+  workflow_dispatch:
+
+concurrency:
+  group: sync-pr-${{ github.event.workflow_run.pull_requests[0].number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  sync-single:
+    if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract PR info
+        id: pr_info
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR_NUM="${{ github.event.workflow_run.pull_requests[0].number }}"
+          HEAD_SHA="${{ github.event.workflow_run.head_sha }}"
+          HEAD_REF="${{ github.event.workflow_run.head_branch }}"
+          BASE_SHA=""
+
+          if [ -n "$PR_NUM" ]; then
+            BASE_SHA=$(gh pr view "$PR_NUM" --repo ${{ github.repository }} \
+              --json baseRefOid --jq '.baseRefOid' 2>/dev/null || echo "")
+          else
+            echo "pull_requests[] empty (fork PR) — looking up PR from head SHA"
+            PR_NUM=$(gh pr list --repo ${{ github.repository }} \
+              --head "$HEAD_REF" --state open --json number --jq '.[0].number' 2>/dev/null || echo "")
+            if [ -n "$PR_NUM" ]; then
+              BASE_SHA=$(gh pr view "$PR_NUM" --repo ${{ github.repository }} \
+                --json baseRefOid --jq '.baseRefOid' 2>/dev/null || echo "")
+            fi
+          fi
+
+          echo "pr_number=${PR_NUM}" >> "$GITHUB_OUTPUT"
+          echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+          echo "head_ref=${HEAD_REF}" >> "$GITHUB_OUTPUT"
+          echo "base_sha=${BASE_SHA}" >> "$GITHUB_OUTPUT"
+
+          echo "Extracted: PR #${PR_NUM}, SHA ${HEAD_SHA}, branch ${HEAD_REF}"
+
+      - name: Skip if bot commit
+        id: skip_check
+        run: |
+          COMMIT_JSON=$(curl -s \
+            "https://api.github.com/repos/${{ github.repository }}/commits/${{ steps.pr_info.outputs.head_sha }}" \
+            | jq -r '{author: (.author.login // "unknown"), committer: (.committer.login // "unknown")}')
+          AUTHOR=$(echo "$COMMIT_JSON" | jq -r '.author')
+          COMMITTER=$(echo "$COMMIT_JSON" | jq -r '.committer')
+          if echo "$AUTHOR $COMMITTER" | grep -qE "github-actions\[bot\]|Gimbarr-Nomenclatura-Sync\[bot\]|\[Bot\]belito"; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Last commit by author=$AUTHOR committer=$COMMITTER — skipping"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate installation token
+        if: steps.skip_check.outputs.skip != 'true'
+        id: app_token
+        uses: actions/create-github-app-token@v2.2.2
+        with:
+          app-id: ${{ secrets.NOMENCLATURA_APP_ID }}
+          private-key: ${{ secrets.NOMENCLATURA_APP_KEY }}
+          owner: Gaiantis-Co
+          repositories: Gimbarr-BackEnd,Gimbarr-Nomenclatura
+
+      - name: Download artifact from validate workflow
+        if: steps.skip_check.outputs.skip != 'true'
+        id: download
+        continue-on-error: true  # no-patches caso: validate puede no subir artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: community-pr-patch
+          path: /tmp/artifact
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      - name: Check artifact availability
+        if: steps.skip_check.outputs.skip != 'true'
+        id: artifact_check
+        run: |
+          if [ "${{ steps.download.outcome }}" != "success" ] || [ ! -f "/tmp/artifact/manifest.json" ]; then
+            echo "No artifact found — validate-community-pr.yml produced no patches to sync"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Inspect artifact
+        if: steps.skip_check.outputs.skip != 'true' && steps.artifact_check.outputs.available == 'true'
+        run: |
+          echo "=== manifest.json ==="
+          cat /tmp/artifact/manifest.json
+          echo ""
+          echo "=== Patches ==="
+          ls -la /tmp/artifact/patch-sequence/
+          echo ""
+          echo "=== .sync-metadata.yml ==="
+          cat /tmp/artifact/.sync-metadata.yml
+
+      - name: Validate artifact against GitHub API
+        if: steps.skip_check.outputs.skip != 'true' && steps.artifact_check.outputs.available == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+        run: |
+          MANIFEST=$(cat /tmp/artifact/manifest.json)
+          EXPECTED_PR=$(echo "$MANIFEST" | jq -r '.public_pr')
+          EXPECTED_SHA=$(echo "$MANIFEST" | jq -r '.public_sha')
+
+          echo "Artifact claims: PR #${EXPECTED_PR}, SHA ${EXPECTED_SHA}"
+
+          ACTUAL_SHA=$(gh pr view "$EXPECTED_PR" --repo ${{ github.repository }} \
+            --json headRefOid --jq '.headRefOid' 2>/dev/null || echo "")
+
+          if [ "$EXPECTED_SHA" != "$ACTUAL_SHA" ]; then
+            echo "❌ SHA mismatch: artifact says ${EXPECTED_SHA}, API says ${ACTUAL_SHA}"
+            # G8: notificar al contribuidor en el PR público
+            gh pr comment "$EXPECTED_PR" --repo ${{ github.repository }} \
+              --body "⚠️ El artifact de sincronización quedó desactualizado (el PR recibió commits nuevos después de la validación). Este evento será ignorado — el próximo push al PR disparará una nueva validación automáticamente." 2>/dev/null || true
+            exit 1
+          fi
+          echo "✅ Artifact validated against API — SHA matches"
+
+      - name: Checkout private repo
+        if: steps.skip_check.outputs.skip != 'true' && steps.artifact_check.outputs.available == 'true'
+        uses: actions/checkout@v6
+        with:
+          repository: Gaiantis-Co/Gimbarr-BackEnd
+          token: ${{ steps.app_token.outputs.token }}
+          path: private
+          fetch-depth: 0
+
+      - name: Check for existing mirror
+        if: steps.skip_check.outputs.skip != 'true' && steps.artifact_check.outputs.available == 'true'
+        id: check_mirror
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+        run: |
+          PUBLIC_PR=${{ steps.pr_info.outputs.pr_number }}
+          PUBLIC_SHA="${{ steps.pr_info.outputs.head_sha }}"
+
+          EXISTING=$(gh pr list \
+            --repo Gaiantis-Co/Gimbarr-BackEnd \
+            --state open \
+            --json number,headRefName,body \
+            --jq ".[] | select(.body | contains(\"public_pr: ${PUBLIC_PR}\"))")
+
+          if [ -z "$EXISTING" ]; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No existing mirror for PR #${PUBLIC_PR}"
+            exit 0
+          fi
+
+          OLD_PR=$(echo "$EXISTING" | jq -r '.number')
+          OLD_BRANCH=$(echo "$EXISTING" | jq -r '.headRefName')
+          OLD_SHA=$(echo "$EXISTING" | jq -r '.body' | grep 'public_sha:' | awk '{print $2}')
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "old_pr=${OLD_PR}" >> "$GITHUB_OUTPUT"
+          echo "old_branch=${OLD_BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "old_sha=${OLD_SHA}" >> "$GITHUB_OUTPUT"
+
+          if [ "$OLD_SHA" = "$PUBLIC_SHA" ]; then
+            echo "synced=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Mirror already at ${OLD_SHA}"
+          else
+            echo "synced=false" >> "$GITHUB_OUTPUT"
+            echo "⚠️  SHA changed: ${OLD_SHA} → ${PUBLIC_SHA}"
+          fi
+
+      - name: Close outdated mirror
+        if: steps.skip_check.outputs.skip != 'true' && steps.artifact_check.outputs.available == 'true' && steps.check_mirror.outputs.found == 'true' && steps.check_mirror.outputs.synced == 'false'
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+        run: |
+          cd "$GITHUB_WORKSPACE/private"
+          OLD_BRANCH="${{ steps.check_mirror.outputs.old_branch }}"
+          OLD_PR="${{ steps.check_mirror.outputs.old_pr }}"
+          OLD_SHA="${{ steps.check_mirror.outputs.old_sha }}"
+
+          git fetch origin "$OLD_BRANCH"
+          git checkout -b "tmp-supersede" "origin/${OLD_BRANCH}"
+
+          cat > .sync-metadata.yml <<EOF
+          sync:
+            type: gimbarr-community-mirror
+            status: superseded
+          public:
+            repository: Gaiantis-Co/Gimbarr-Nomenclatura
+            pull_request: ${OLD_PR}
+            head_sha: ${OLD_SHA}
+          EOF
+
+          git config user.name "[Bot]belito"
+          git config user.email "[Bot]belito@users.noreply.github.com"
+          git add .sync-metadata.yml
+          git commit -m "sync: mark mirror as superseded"
+          git push origin "tmp-supersede:${OLD_BRANCH}"
+
+          gh pr close "$OLD_PR" --repo Gaiantis-Co/Gimbarr-BackEnd \
+            --comment "Mirror reemplazado — PR público actualizado a nuevo SHA."
+
+      - name: Rewrite patch paths (public root → private path)
+        if: steps.skip_check.outputs.skip != 'true' && steps.artifact_check.outputs.available == 'true' && steps.check_mirror.outputs.synced != 'true'
+        run: |
+          PREFIX="docs/community/Gimbarr-Nomenclatura"
+          PATCHES="/tmp/artifact/patch-sequence"
+          for p in "${PATCHES}"/*.patch; do
+            sed -i -E \
+              -e "s|^(diff --git )a/(.+) b/(.+)$|\1a/${PREFIX}/\2 b/${PREFIX}/\3|" \
+              -e "s|^--- a/(.+)$|--- a/${PREFIX}/\1|" \
+              -e "s|^[+][+][+] b/(.+)$|+++ b/${PREFIX}/\1|" \
+              "$p"
+          done
+          echo "✅ Patch paths rewritten to private repo format"
+
+      - name: Validate and inspect patches
+        if: steps.skip_check.outputs.skip != 'true' && steps.artifact_check.outputs.available == 'true' && steps.check_mirror.outputs.synced != 'true'
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+        run: |
+          PR_NUM=${{ steps.pr_info.outputs.pr_number }}
+          PATCHES="/tmp/artifact/patch-sequence"
+
+          cd "$GITHUB_WORKSPACE/private"
+
+          # G6: Dry-run apply para detectar conflictos antes de git am
+          if ! git apply --check \
+            "${PATCHES}"/*.patch 2>&1; then
+            echo "❌ git apply --check failed — patches conflict with private repo state"
+            gh pr comment "$PR_NUM" --repo ${{ github.repository }} \
+              --body "❌ Los patches de este PR generan conflictos al aplicarse en el repositorio privado. Por favor sincroniza tu branch con los últimos cambios del repositorio público e intenta de nuevo." 2>/dev/null || true
+            exit 1
+          fi
+          echo "✅ git apply --check passed — no conflicts"
+
+          # G7: Inspección de diff headers — restricciones de seguridad
+          TOTAL_FILES=0
+          TOTAL_SIZE=0
+
+          for p in "${PATCHES}"/*.patch; do
+            # Rechazar archivos binarios
+            if grep -q '^Binary files' "$p"; then
+              echo "❌ Patch contains binary files: $p"
+              gh pr comment "$PR_NUM" --repo ${{ github.repository }} \
+                --body "❌ Este PR contiene archivos binarios. Solo se aceptan archivos de texto en el repositorio de documentación." 2>/dev/null || true
+              exit 1
+            fi
+
+            # Rechazar rutas fuera de docs/community/Gimbarr-Nomenclatura/
+            OUTSIDE_PATHS=$(grep '^diff --git' "$p" \
+              | awk '{print $3}' \
+              | sed 's|^a/||' \
+              | sed 's|^b/||' \
+              | grep -v -E '^docs/community/Gimbarr-Nomenclatura/' || true)
+            if [ -n "$OUTSIDE_PATHS" ]; then
+              echo "❌ Patch contains paths outside docs/community/Gimbarr-Nomenclatura/:"
+              echo "$OUTSIDE_PATHS"
+              gh pr comment "$PR_NUM" --repo ${{ github.repository }} \
+                --body "❌ El patch contiene rutas fuera de \`docs/community/Gimbarr-Nomenclatura/\`. Patch rechazado por política de seguridad." 2>/dev/null || true
+              exit 1
+            fi
+
+            FILES_IN_PATCH=$(grep -c '^diff --git' "$p" 2>/dev/null || echo 0)
+            TOTAL_FILES=$((TOTAL_FILES + FILES_IN_PATCH))
+            PATCH_SIZE=$(wc -c < "$p")
+            TOTAL_SIZE=$((TOTAL_SIZE + PATCH_SIZE))
+          done
+
+          if [ "$TOTAL_FILES" -gt 10 ]; then
+            echo "❌ Too many files modified: ${TOTAL_FILES} (max 10)"
+            gh pr comment "$PR_NUM" --repo ${{ github.repository }} \
+              --body "❌ Este PR modifica demasiados archivos (${TOTAL_FILES}). El límite es 10 archivos por PR." 2>/dev/null || true
+            exit 1
+          fi
+
+          if [ "$TOTAL_SIZE" -gt 1048576 ]; then
+            echo "❌ Patch too large: ${TOTAL_SIZE} bytes (max 1MB)"
+            gh pr comment "$PR_NUM" --repo ${{ github.repository }} \
+              --body "❌ El tamaño total del patch (${TOTAL_SIZE} bytes) supera el límite permitido de 1MB." 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "✅ Patch security check passed: ${TOTAL_FILES} files, ${TOTAL_SIZE} bytes"
+
+      - name: Create mirror PR in private repo
+        if: steps.skip_check.outputs.skip != 'true' && steps.artifact_check.outputs.available == 'true' && steps.check_mirror.outputs.synced != 'true'
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+        run: |
+          PR_NUM=${{ steps.pr_info.outputs.pr_number }}
+          HEAD_REF="${{ steps.pr_info.outputs.head_ref }}"
+          HEAD_SHA="${{ steps.pr_info.outputs.head_sha }}"
+          SHORT_SHA="${HEAD_SHA:0:7}"
+          BRANCH="mirror/pr-${PR_NUM}-${SHORT_SHA}"
+
+          cd "$GITHUB_WORKSPACE/private"
+          PATCHES="/tmp/artifact/patch-sequence"
+
+          PRIVATE_BASE_SHA=$(git rev-parse origin/main)
+          git checkout -b "$BRANCH" origin/main
+
+          git config user.name "[Bot]belito"
+          git config user.email "[Bot]belito@users.noreply.github.com"
+
+          git am "${PATCHES}"/*.patch 2>&1 || {
+            echo "❌ git am failed — patches may conflict with private state"
+            git am --abort 2>/dev/null || true
+            exit 1
+          }
+
+          cat > .sync-metadata.yml <<EOF
+          sync:
+            type: gimbarr-community-mirror
+            status: active
+          public:
+            repository: Gaiantis-Co/Gimbarr-Nomenclatura
+            pull_request: ${PR_NUM}
+            head_sha: ${HEAD_SHA}
+            head_ref: ${HEAD_REF}
+          mirror:
+            branch: ${BRANCH}
+            private_base_sha: ${PRIVATE_BASE_SHA}
+            created_by: sync-pr-to-private.yml
+          EOF
+
+          git add .sync-metadata.yml
+          git commit -m "sync: add mirror metadata"
+
+          git push origin "$BRANCH"
+
+          MIRROR_PR_URL=$(gh pr create \
+            --repo Gaiantis-Co/Gimbarr-BackEnd \
+            --base main \
+            --head "$BRANCH" \
+            --title "Docs: ${HEAD_REF} (PR #${PR_NUM})" \
+            --body "<!-- gimbarr-sync -->
+
+          public_repo:      Gaiantis-Co/Gimbarr-Nomenclatura
+          public_pr:        ${PR_NUM}
+          public_sha:       ${HEAD_SHA}
+          public_head_ref:  ${HEAD_REF}
+          created_at:       $(date -u +'%Y-%m-%dT%H:%M:%SZ')
+
+          ---
+
+          Propuesta de cambios desde [PR #${PR_NUM}](https://github.com/Gaiantis-Co/Gimbarr-Nomenclatura/pull/${PR_NUM}) — ${HEAD_REF}." 2>&1)
+
+          MIRROR_PR=$(echo "$MIRROR_PR_URL" | grep -o '/pull/[0-9]*' | grep -o '[0-9]*$')
+          gh label create sync-mirror --repo Gaiantis-Co/Gimbarr-BackEnd 2>/dev/null || true
+          gh label create source:community --color "0075ca" --repo Gaiantis-Co/Gimbarr-BackEnd 2>/dev/null || true
+          gh pr edit "$MIRROR_PR" --repo Gaiantis-Co/Gimbarr-BackEnd \
+            --add-label "sync-mirror,source:community" 2>/dev/null || true
+
+          echo "✅ Mirror PR created: ${BRANCH} (#${MIRROR_PR})"
+
+  reconcile:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate installation token
+        id: app_token
+        uses: actions/create-github-app-token@v2.2.2
+        with:
+          app-id: ${{ secrets.NOMENCLATURA_APP_ID }}
+          private-key: ${{ secrets.NOMENCLATURA_APP_KEY }}
+          owner: Gaiantis-Co
+          repositories: Gimbarr-BackEnd,Gimbarr-Nomenclatura
+
+      - name: Checkout private repo
+        uses: actions/checkout@v6
+        with:
+          repository: Gaiantis-Co/Gimbarr-BackEnd
+          token: ${{ steps.app_token.outputs.token }}
+          path: private
+
+      - name: Reconcile — detect divergences, never auto-sync
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+        run: |
+          gh pr list --repo Gaiantis-Co/Gimbarr-BackEnd \
+            --state open --json number,title,body,headRefName \
+            --jq '[.[] | select(.body | test("gimbarr-sync"))]' > /tmp/mirrors.json
+
+          echo "Found $(jq 'length' /tmp/mirrors.json) mirror PRs to check"
+
+          jq -c '.[]' /tmp/mirrors.json | while read -r pr; do
+            PR_NUM=$(echo "$pr" | jq -r '.number')
+            BODY=$(echo "$pr" | jq -r '.body')
+            HEAD_REF=$(echo "$pr" | jq -r '.headRefName')
+
+            PUBLIC_PR=$(echo "$BODY" | grep 'public_pr:' | awk '{print $2}')
+            PUBLIC_SHA=$(echo "$BODY" | grep 'public_sha:' | awk '{print $2}')
+
+            echo "---"
+            echo "Mirror PR #${PR_NUM} → public PR #${PUBLIC_PR}"
+
+            PUBLIC_STATE=$(gh pr view "$PUBLIC_PR" --repo Gaiantis-Co/Gimbarr-Nomenclatura \
+              --json state --jq '.state' 2>/dev/null || echo "NOT_FOUND")
+
+            if [ "$PUBLIC_STATE" != "OPEN" ]; then
+              echo "⚠️  Public PR #${PUBLIC_PR} is ${PUBLIC_STATE} — closing mirror"
+              gh pr close "$PR_NUM" --repo Gaiantis-Co/Gimbarr-BackEnd \
+                --comment "🔄 PR original #${PUBLIC_PR} está ${PUBLIC_STATE}. Mirror cerrado automáticamente."
+              continue
+            fi
+
+            CURRENT_SHA=$(gh pr view "$PUBLIC_PR" --repo Gaiantis-Co/Gimbarr-Nomenclatura \
+              --json headRefOid --jq '.headRefOid' 2>/dev/null || echo "")
+
+            if [ "$PUBLIC_SHA" != "$CURRENT_SHA" ]; then
+              echo "⚠️  SHA divergence: expected ${PUBLIC_SHA}, got ${CURRENT_SHA}"
+              DRIFT_BODY="⚠️ **Divergencia detectada**\n\nEl PR público #${PUBLIC_PR} cambió después de crear este espejo.\n\n- SHA del espejo: \`${PUBLIC_SHA}\`\n- SHA actual público: \`${CURRENT_SHA}\`\n\nRequiere nueva revisión del maintainer."
+              gh pr comment "$PR_NUM" --repo Gaiantis-Co/Gimbarr-BackEnd \
+                --body "$DRIFT_BODY"
+              continue
+            fi
+
+            echo "✅ En sincronía — PR #${PUBLIC_PR} still at ${PUBLIC_SHA}"
+          done
+
+          echo "=== Reconcile complete ==="
